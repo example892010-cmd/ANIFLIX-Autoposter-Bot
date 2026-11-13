@@ -424,14 +424,44 @@ async def _publish_batch1renamed_link(client, message, details: dict) -> None:
         logger.exception("Link-only /batch1renamed Ongoing publication failed")
         ongoing_result = f"❌ Ongoing publication failed: {type(exc).__name__}: {exc}"
 
-    await message.reply_text(
+    report_text = (
         f"🎬 {title} • Season {season} • Episode {episode}\n\n"
         f"📺 Anime Post:\n{anime_result}\n\n"
         f"📡 Ongoing:\n{ongoing_result}\n\n"
-        "No media was downloaded or stored by this command.",
+        "No media was downloaded or stored by this command."
+    )
+    await message.reply_text(
+        report_text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 DELETE POST", callback_data="delete_batch1renamed_report")]
+        ]),
         disable_web_page_preview=True,
         parse_mode=enums.ParseMode.DISABLED,
     )
+
+
+@Client.on_callback_query(filters.regex(r"^delete_batch1renamed_report$"))
+async def delete_batch1renamed_report(client: Client, query: CallbackQuery):
+    """Delete only the /batch1renamed result/report message, never channel posts."""
+    report_message = query.message
+    if report_message is None:
+        return await query.answer("This report message is no longer available.", show_alert=True)
+
+    if not _is_batch_admin(query.from_user):
+        return await query.answer("Only the bot owner/admin can delete this report.", show_alert=True)
+
+    try:
+        await report_message.delete()
+        await query.answer("Report deleted.")
+    except Exception as exc:
+        logger.exception("Could not delete /batch1renamed report message")
+        try:
+            await query.answer(
+                f"Could not delete this report: {type(exc).__name__}",
+                show_alert=True,
+            )
+        except Exception:
+            pass
 
 
 async def _active_batch_task(user_id: int) -> dict | None:
