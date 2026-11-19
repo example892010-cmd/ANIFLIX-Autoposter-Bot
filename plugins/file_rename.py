@@ -322,15 +322,287 @@ def _build_batch1renamed_button_rows(template: str, details: dict, stored_link: 
     return rows
 
 
+def _parse_batchcompleted_payload(message_text: str) -> dict:
+    """Parse /batchcompleted text while preserving the season and episode formatting."""
+    raw = (message_text or "").strip()
+    if not raw:
+        raise ValueError(
+            "Send /batchcompleted followed by the anime title, season, episode range, and download URL."
+        )
+
+    lines = raw.splitlines()
+    command_match = re.match(
+        r"^\s*/batchcompleted(?:@\w+)?(?:\s+(.*))?\s*$",
+        lines[0],
+        re.IGNORECASE,
+    )
+    if not command_match:
+        raise ValueError("The message must start with /batchcompleted.")
+
+    inline_title = (command_match.group(1) or "").strip()
+    body = "\n".join(([inline_title] if inline_title else []) + lines[1:])
+    url_matches = list(re.finditer(r"https?://[^\s<>]+", body, re.IGNORECASE))
+    if len(url_matches) != 1:
+        raise ValueError("Include exactly one complete http:// or https:// download link.")
+
+    link = url_matches[0].group(0).rstrip(".,;:!?)]")
+    parsed_link = urlparse(link)
+    if parsed_link.scheme.lower() not in {"http", "https"} or not parsed_link.netloc:
+        raise ValueError("The download link is invalid. Use a complete http:// or https:// URL.")
+    body = body.replace(url_matches[0].group(0), " ", 1)
+    detail_lines = []
+    for line in body.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        cleaned = re.sub(
+            r"(?i)^(?:(?:here(?:\s+is)?\s+the\s+)?(?:download\s*)?link)\s*[:\-]?\s*",
+            "",
+            cleaned,
+        ).strip()
+        if cleaned.casefold() in {"link", "download link", "here the link", "here is the link"}:
+            continue
+        if cleaned:
+            detail_lines.append(cleaned)
+
+    if len(detail_lines) < 3:
+        raise ValueError(
+            "Use this format:\n\n"
+            "/batchcompleted\nJUJUTSU KAISEN\nSeason 01 - 03\n01 - 12\nhttps://your-download-link"
+        )
+
+    title_parts = detail_lines[:-2]
+    raw_season = detail_lines[-2]
+    raw_episode = detail_lines[-1]
+    title = " ".join(
+        re.sub(r"(?i)^(?:anime|title)\s*:\s*", "", part).strip()
+        for part in title_parts
+    ).strip()
+    season_match = re.fullmatch(
+        r"\s*(?:season\s*)?(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*",
+        raw_season,
+        re.IGNORECASE,
+    )
+    episode_match = re.fullmatch(
+        r"\s*(?:episode\s*)?(\d{1,6})(?:\s*[-–]\s*(\d{1,6}))?\s*",
+        raw_episode,
+        re.IGNORECASE,
+    )
+    if not title:
+        raise ValueError("Anime title is missing.")
+    if not season_match:
+        raise ValueError("Season must be a number or range, for example: Season 01 - 03 or 01.")
+    if not episode_match:
+        raise ValueError("Episode must be a number or range, for example: 01 - 12 or 01.")
+
+    season_start, season_end = season_match.groups()
+    episode_start, episode_end = episode_match.groups()
+    if season_end and int(season_end) < int(season_start):
+        raise ValueError("The ending season cannot be less than the starting season.")
+    if episode_end and int(episode_end) < int(episode_start):
+        raise ValueError("The ending episode cannot be less than the starting episode.")
+
+    season = f"{season_start} - {season_end}" if season_end else season_start
+    episode_range = f"{episode_start} - {episode_end}" if episode_end else episode_start
+    return {
+        "title": title,
+        "season": season,
+        "episode_range": episode_range,
+        "stored_link": link,
+    }
+
+
+async def _find_saved_anime_route(title: str) -> tuple[dict | None, dict | None]:
+    """Resolve a saved Template Set and its route regardless of title letter case.
+
+    New Template Sets use a normalized, case-folded key. The case-insensitive
+    fallbacks also support older records whose title_key or string _id was saved
+    with its original capitalization.
+    """
+    title_key = normalize_anime_title(title)
+    if not title_key:
+        return None, None
+
+    database = codeflixbots.codeflixbots
+    template_sets = database["anime_templates"]
+    routes = database["anime_routes"]
+    case_insensitive_key = {"$regex": "^" + re.escape(title_key) + "$", "$options": "i"}
+
+    template_set = await template_sets.find_one({"_id": title_key})
+    if not template_set:
+        template_set = await template_sets.find_one({"title_key": title_key})
+    if not template_set:
+        template_set = await template_sets.find_one({"_id": case_insensitive_key})
+    if not template_set:
+        template_set = await template_sets.find_one({"title_key": case_insensitive_key})
+
+    route_key = normalize_anime_title(
+        (template_set or {}).get("title_key")
+        or (template_set or {}).get("title")
+        or title
+    )
+    route = await routes.find_one({"title_key": route_key}) if route_key else None
+    if not route and route_key:
+        route_key_regex = {"$regex": "^" + re.escape(route_key) + "$", "$options": "i"}
+        route = await routes.find_one({"title_key": route_key_regex})
+    if not route:
+        route_title = str((template_set or {}).get("title") or title).strip()
+        if route_title:
+            route = await routes.find_one({
+                "title": {"$regex": "^" + re.escape(route_title) + "$", "$options": "i"}
+            })
+
+    # If only the route exists (legacy setup), still try to find its Template Set
+    # so the same normalized match is used consistently by later publication code.
+    if route and not template_set:
+        route_key = normalize_anime_title(route.get("title_key") or route.get("title") or title)
+        template_set = await template_sets.find_one({"_id": route_key}) if route_key else None
+        if not template_set and route_key:
+            route_key_regex = {"$regex": "^" + re.escape(route_key) + "$", "$options": "i"}
+            template_set = await template_sets.find_one({"_id": route_key_regex})
+
+    return route, template_set
+
+
+async def _publish_batchcompleted(client, message, details: dict, poster_file_id: str | None = None) -> None:
+    """Publish a completed anime using saved text/button templates and the submitted URL."""
+    title = str(details.get("title") or "").strip()
+    title_key = normalize_anime_title(title)
+    link = str(details.get("stored_link") or "").strip()
+    route, _template_set = await _find_saved_anime_route(title)
+    if not route:
+        await message.reply_text(
+            f"❌ No saved channel settings were found for {title}. Add it in Admin Panel → Anime Channels first."
+        )
+        return
+
+    season = str(details.get("season") or "").strip()
+    episode = str(details.get("episode_range") or "").strip()
+    settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
+    ongoing_details = route.get("ongoing_details") or {}
+    anime_result = "❌ Anime Post was not published."
+
+    if route.get("anime_post_skipped"):
+        anime_result = "⏭️ Anime Post is skipped in this anime's saved Template Set."
+    else:
+        try:
+            individual_target = route.get("individual_channel")
+            if not individual_target:
+                raise RuntimeError("No Anime Post channel is assigned to this anime.")
+
+            button_template = (
+                settings.get("batch1renamed_button_template")
+                or DEFAULT_BATCH1RENAMED_BUTTON_TEMPLATE
+            )
+            button_rows = _build_batch1renamed_button_rows(button_template, details, link)
+            caption_template = settings.get("anime_post_template") or DEFAULT_INDIVIDUAL_TEMPLATE
+            caption_values = {
+                "title": title,
+                "anime": title,
+                "season": season,
+                "episode": episode,
+                "episode_range": episode,
+                "qualities": ongoing_details.get("qualities") or "Complete Episodes",
+                "status": "COMPLETED",
+                "audio": ongoing_details.get("audio") or "Tamil Audio",
+                "quality_480p": "",
+                "quality_720p": "",
+                "quality_1080p": "",
+                "link_480p": "",
+                "link_720p": "",
+                "link_1080p": "",
+            }
+            caption = _safe_template(caption_template, caption_values)
+            api_target = (
+                int(individual_target)
+                if isinstance(individual_target, str) and individual_target.lstrip("-").isdigit()
+                else individual_target
+            )
+            sent_id = await _send_ongoing_bot_api(
+                client, api_target, poster_file_id, caption, button_rows
+            )
+            anime_result = f"✅ Published to Anime Post channel {individual_target} (message {sent_id})."
+            try:
+                await codeflixbots.codeflixbots["renamed_link_posts"].insert_one({
+                    "user_id": int(message.from_user.id),
+                    "title": title,
+                    "title_key": title_key,
+                    "season": season,
+                    "episode": episode,
+                    "url": link,
+                    "channel_id": api_target,
+                    "message_id": int(sent_id),
+                    "post_type": "batchcompleted",
+                    "created_at": datetime.utcnow(),
+                })
+            except Exception:
+                logger.exception("Completed Anime Post sent but history could not be saved")
+        except Exception as exc:
+            logger.exception("/batchcompleted Anime Post failed for %s", title)
+            anime_result = f"❌ Anime Post failed: {type(exc).__name__}: {exc}"
+
+    try:
+        ongoing_result = await _post_ongoing_anime(
+            client,
+            str(route.get("title") or title),
+            season=season,
+            episode_range=episode,
+            fallback_download_url=link,
+            poster_override=poster_file_id,
+            use_saved_poster=False,
+            status_override="COMPLETED",
+        )
+    except Exception as exc:
+        logger.exception("/batchcompleted Ongoing publication failed for %s", title)
+        ongoing_result = f"❌ Ongoing publication failed: {type(exc).__name__}: {exc}"
+
+    report = (
+        f"🎬 {title} • Season {season} • Episode {episode} • COMPLETED\n\n"
+        f"📺 Anime Post:\n{anime_result}\n\n"
+        f"📡 Ongoing:\n{ongoing_result}\n\n"
+        f"🖼 Poster: {'Supplied poster' if poster_file_id else 'No poster'}\n"
+        "The submitted URL was placed in the Ongoing Download button."
+    )
+    await message.reply_text(
+        report,
+        disable_web_page_preview=True,
+        parse_mode=enums.ParseMode.DISABLED,
+    )
+
+
+@Client.on_message(
+    filters.private & (filters.command("batchcompleted") | filters.caption),
+    group=-7,
+)
+async def batch_completed_command(client: Client, message):
+    """Publish a completed anime from a single command, with an optional attached poster."""
+    message_text = message.text or message.caption or ""
+    if not re.match(r"^\s*/batchcompleted(?:@\w+)?(?:\s|$)", message_text, re.IGNORECASE):
+        return
+
+    user = getattr(message, "from_user", None)
+    if not user or not _is_batch_admin(user):
+        return await message.reply_text("⛔ Owner/admin only.")
+
+    try:
+        details = _parse_batchcompleted_payload(message_text)
+    except ValueError as exc:
+        return await message.reply_text(f"❌ {exc}", parse_mode=enums.ParseMode.DISABLED)
+
+    poster = getattr(getattr(message, "photo", None), "file_id", None)
+    if not poster:
+        reply_photo = getattr(message, "reply_to_message", None)
+        poster = getattr(getattr(reply_photo, "photo", None), "file_id", None)
+
+    await _publish_batchcompleted(client, message, details, poster_file_id=poster)
+
+
 async def _publish_batch1renamed_link(client, message, details: dict) -> None:
     """Publish a supplied stored link to Anime Post and Ongoing without media handling."""
     title = str(details.get("title") or "").strip()
     title_key = normalize_anime_title(title)
     link = str(details.get("stored_link") or "").strip()
-    routes = codeflixbots.codeflixbots["anime_routes"]
-    route = await routes.find_one({"title_key": title_key}) if title_key else None
-    if not route and title:
-        route = await routes.find_one({"title": {"$regex": "^" + re.escape(title) + "$", "$options": "i"}})
+    route, _template_set = await _find_saved_anime_route(title)
     if not route:
         await message.reply_text(
             f"❌ No saved channel settings were found for {title}. Add it in Admin Panel → Anime Channels first."

@@ -196,6 +196,9 @@ async def post_ongoing_anime(
     season: str | None = None,
     episode_range: str | None = None,
     fallback_download_url: str | None = None,
+    poster_override: str | None = None,
+    use_saved_poster: bool = True,
+    status_override: str | None = None,
 ) -> str:
     """Publish the selected anime's ongoing post to its saved ongoing channel targets."""
     key = _title_key(title)
@@ -230,6 +233,16 @@ async def post_ongoing_anime(
         )
     except ValueError as exc:
         return f"❌ Ongoing button template error: {exc}"
+    if fallback_download_url:
+        expected_download_url = str(fallback_download_url).strip()
+        if not any(
+            str(button.get("url") or "").strip() == expected_download_url
+            for row in button_rows for button in row
+        ):
+            return (
+                "❌ The saved Ongoing Buttons template has no dynamic Download button. "
+                "Add {anime_invite} or use a button label containing DOWNLOAD so the supplied link can replace it."
+            )
 
     targets = await resolve_ongoing_targets(route, codeflixbots.codeflixbots)
     if not targets:
@@ -257,12 +270,17 @@ async def post_ongoing_anime(
         "episode_range": episode_value,
         "episode": episode_value,
         "tag": details.get("tag") or "",
-        "status": details.get("status") or "ONGOING",
+        "status": str(status_override).strip() if status_override else (details.get("status") or "ONGOING"),
         "qualities": qualities,
         "audio": "Tamil Audio",
     }
     template = post_settings.get("ongoing_template") or DEFAULT_ONGOING_TEMPLATE
-    poster = saved_template.get("poster_file_id") or route.get("poster_file_id")
+    if poster_override:
+        poster = poster_override
+    elif use_saved_poster:
+        poster = saved_template.get("poster_file_id") or route.get("poster_file_id")
+    else:
+        poster = None
     caption = _render_template(template, values, limit=1024 if poster else 4096)
 
     success, failures = [], []
