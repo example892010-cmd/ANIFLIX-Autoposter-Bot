@@ -465,92 +465,23 @@ async def _find_saved_anime_route(title: str) -> tuple[dict | None, dict | None]
 
 
 async def _publish_batchcompleted(client, message, details: dict, poster_file_id: str | None = None) -> None:
-    """Publish a completed anime using saved text/button templates and the submitted URL."""
+    """Publish only to global Ongoing Channels using the saved ongoing templates."""
     title = str(details.get("title") or "").strip()
-    title_key = normalize_anime_title(title)
-    link = str(details.get("stored_link") or "").strip()
-    route, _template_set = await _find_saved_anime_route(title)
-    if not route:
-        await message.reply_text(
-            f"❌ No saved channel settings were found for {title}. Add it in Admin Panel → Anime Channels first."
-        )
-        return
-
     season = str(details.get("season") or "").strip()
     episode = str(details.get("episode_range") or "").strip()
-    settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
-    ongoing_details = route.get("ongoing_details") or {}
-    anime_result = "❌ Anime Post was not published."
-
-    if route.get("anime_post_skipped"):
-        anime_result = "⏭️ Anime Post is skipped in this anime's saved Template Set."
-    else:
-        try:
-            individual_target = route.get("individual_channel")
-            if not individual_target:
-                raise RuntimeError("No Anime Post channel is assigned to this anime.")
-
-            button_template = (
-                settings.get("batch1renamed_button_template")
-                or DEFAULT_BATCH1RENAMED_BUTTON_TEMPLATE
-            )
-            button_rows = _build_batch1renamed_button_rows(button_template, details, link)
-            caption_template = settings.get("anime_post_template") or DEFAULT_INDIVIDUAL_TEMPLATE
-            caption_values = {
-                "title": title,
-                "anime": title,
-                "season": season,
-                "episode": episode,
-                "episode_range": episode,
-                "qualities": ongoing_details.get("qualities") or "Complete Episodes",
-                "status": "COMPLETED",
-                "audio": ongoing_details.get("audio") or "Tamil Audio",
-                "quality_480p": "",
-                "quality_720p": "",
-                "quality_1080p": "",
-                "link_480p": "",
-                "link_720p": "",
-                "link_1080p": "",
-            }
-            caption = _safe_template(caption_template, caption_values)
-            api_target = (
-                int(individual_target)
-                if isinstance(individual_target, str) and individual_target.lstrip("-").isdigit()
-                else individual_target
-            )
-            sent_id = await _send_ongoing_bot_api(
-                client, api_target, poster_file_id, caption, button_rows
-            )
-            anime_result = f"✅ Published to Anime Post channel {individual_target} (message {sent_id})."
-            try:
-                await codeflixbots.codeflixbots["renamed_link_posts"].insert_one({
-                    "user_id": int(message.from_user.id),
-                    "title": title,
-                    "title_key": title_key,
-                    "season": season,
-                    "episode": episode,
-                    "url": link,
-                    "channel_id": api_target,
-                    "message_id": int(sent_id),
-                    "post_type": "batchcompleted",
-                    "created_at": datetime.utcnow(),
-                })
-            except Exception:
-                logger.exception("Completed Anime Post sent but history could not be saved")
-        except Exception as exc:
-            logger.exception("/batchcompleted Anime Post failed for %s", title)
-            anime_result = f"❌ Anime Post failed: {type(exc).__name__}: {exc}"
+    link = str(details.get("stored_link") or "").strip()
 
     try:
         ongoing_result = await _post_ongoing_anime(
             client,
-            str(route.get("title") or title),
+            title,
             season=season,
             episode_range=episode,
             fallback_download_url=link,
             poster_override=poster_file_id,
             use_saved_poster=False,
             status_override="COMPLETED",
+            global_targets_only=True,
         )
     except Exception as exc:
         logger.exception("/batchcompleted Ongoing publication failed for %s", title)
@@ -558,10 +489,9 @@ async def _publish_batchcompleted(client, message, details: dict, poster_file_id
 
     report = (
         f"🎬 {title} • Season {season} • Episode {episode} • COMPLETED\n\n"
-        f"📺 Anime Post:\n{anime_result}\n\n"
-        f"📡 Ongoing:\n{ongoing_result}\n\n"
+        f"📡 Ongoing Channels:\n{ongoing_result}\n\n"
         f"🖼 Poster: {'Supplied poster' if poster_file_id else 'No poster'}\n"
-        "The submitted URL was placed in the Ongoing Download button."
+        "The supplied link was used in the Ongoing Download button."
     )
     await message.reply_text(
         report,

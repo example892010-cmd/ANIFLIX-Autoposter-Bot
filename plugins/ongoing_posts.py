@@ -199,18 +199,25 @@ async def post_ongoing_anime(
     poster_override: str | None = None,
     use_saved_poster: bool = True,
     status_override: str | None = None,
+    global_targets_only: bool = False,
 ) -> str:
-    """Publish the selected anime's ongoing post to its saved ongoing channel targets."""
+    """Publish an ongoing post; optionally use only globally configured ongoing channels."""
     key = _title_key(title)
     if not key:
         return "❌ Send an anime title, e.g. /ongoing Naruto Shippuden."
 
     routes = codeflixbots.codeflixbots["anime_routes"]
-    route = await routes.find_one({"title_key": key})
-    if not route:
-        route = await routes.find_one({"title": {"$regex": "^" + re.escape(title.strip()) + "$", "$options": "i"}})
-    if not route:
-        return f"❌ No saved channel/template settings were found for {title}. Add it in Admin Panel → Anime Channels."
+    route = None
+    if not global_targets_only:
+        route = await routes.find_one({"title_key": key})
+        if not route:
+            route = await routes.find_one({"title": {"$regex": "^" + re.escape(title.strip()) + "$", "$options": "i"}})
+        if not route:
+            return f"❌ No saved channel/template settings were found for {title}. Add it in Admin Panel → Anime Channels."
+    else:
+        # Completed batch posts intentionally bypass anime-specific Anime Channel
+        # routing and publish to the globally configured Ongoing Channels only.
+        route = {"title": title, "title_key": key, "ongoing_details": {}}
 
     invite_collection = codeflixbots.codeflixbots["anime_invite_links"]
     route_key = str(route.get("title_key") or key).strip()
