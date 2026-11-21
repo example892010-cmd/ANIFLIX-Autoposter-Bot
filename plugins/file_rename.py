@@ -1,6 +1,7 @@
 """File download, rename, optional metadata, thumbnail and upload handlers."""
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -97,48 +98,54 @@ def extract_quality_compat(filename):
 
 
 async def _detect_video_quality(path: str, media=None) -> str | None:
-    """Detect quality from the actual video dimensions, not just its filename."""
+    """Detect the real video quality, preferring Telegram metadata to avoid ffprobe."""
     width = height = 0
-
-    # Telegram provides dimensions for normal video messages, but not always for
-    # videos uploaded as documents, so probe the downloaded original file too.
     try:
-        probe = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(probe.communicate(), timeout=12)
-        if probe.returncode == 0:
-            match = re.search(rb"(\d+)x(\d+)", stdout)
-            if match:
-                width, height = int(match.group(1)), int(match.group(2))
-    except (FileNotFoundError, asyncio.TimeoutError, OSError):
-        pass
+        width = int(getattr(media, "width", 0) or 0)
+        height = int(getattr(media, "height", 0) or 0)
+    except (TypeError, ValueError):
+        width = height = 0
 
-    if not height:
+    # Uploaded as documents, Telegram often omits dimensions. Probe only in that
+    # case; normal video uploads avoid an extra subprocess and return faster.
+    if height <= 0:
+        probe = None
         try:
-            width = int(getattr(media, "width", 0) or 0)
-            height = int(getattr(media, "height", 0) or 0)
-        except (TypeError, ValueError):
-            width = height = 0
+            probe = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(probe.communicate(), timeout=8)
+            if probe.returncode == 0:
+                match = re.search(rb"(\d+)x(\d+)", stdout)
+                if match:
+                    width, height = int(match.group(1)), int(match.group(2))
+        except asyncio.TimeoutError:
+            if probe and probe.returncode is None:
+                probe.kill()
+                await probe.wait()
+        except (FileNotFoundError, OSError):
+            pass
 
     if height <= 0:
         return None
-    # Standard release labels follow the video's vertical resolution.
-    if height >= 2000:
+    # Use the shorter dimension so portrait and landscape uploads receive the
+    # same release label (e.g. 1080x1920 is still 1080p).
+    resolution = min(width, height) if width > 0 else height
+    if resolution >= 2000:
         return "2160p"
-    if height >= 1300:
+    if resolution >= 1300:
         return "1440p"
-    if height >= 1000:
+    if resolution >= 1000:
         return "1080p"
-    if height >= 650:
+    if resolution >= 650:
         return "720p"
-    if height >= 430:
+    if resolution >= 430:
         return "480p"
-    if height >= 300:
+    if resolution >= 300:
         return "360p"
-    return f"{height}p"
+    return f"{resolution}p"
 
 
 
@@ -255,6 +262,12 @@ def _parse_batch_command(message_text: str) -> tuple[int, dict] | None:
     title_on_command = (command_match.group(2) or "").strip()
     detail_lines = ([title_on_command] if title_on_command else []) + [line.strip() for line in raw_lines[1:] if line.strip()]
 
+    # New /batch1 mode: collect all three files first, then ask for title/season/
+    # episode/download link. Other batch commands and /batch1renamed retain their
+    # existing details-first behavior.
+    if command_mode == "1" and not detail_lines:
+        return batch_number, {"await_details_after_files": True}
+
     stored_link = None
     if command_mode == "1renamed" and len(detail_lines) >= 4:
         candidate = detail_lines[-1].strip()
@@ -279,6 +292,76 @@ def _parse_batch_command(message_text: str) -> tuple[int, dict] | None:
             details["link_only"] = True
             details["stored_link"] = stored_link
     return batch_number, details
+
+
+def _valid_batch_download_url(value: str) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+        return parsed.scheme in {"https", "http"} and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def _parse_batch1_post_details(text: str, linked_url: str | None = None) -> dict | None:
+    """Parse title, season, episode, and the per-run Ongoing Download URL."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    supplied_url = str(linked_url or "").strip()
+
+    # Also accept a compact pipe-separated form:
+    # Anime Title | Season 01 | 355 | https://...
+    if len(lines) == 1 and "|" in lines[0]:
+        parts = [part.strip() for part in lines[0].split("|")]
+        if len(parts) >= 3:
+            if _valid_batch_download_url(parts[-1]):
+                supplied_url = parts[-1]
+                lines = [part for part in parts[:-1] if part]
+            elif linked_url and len(parts) >= 4 and re.search(r"(?i)\b(link|download)\b", parts[-1]):
+                lines = [part for part in parts[:-1] if part]
+            else:
+                lines = parts
+            raw = "\n".join(lines)
+
+    if lines:
+        # Prefer a raw URL anywhere in the final line (e.g. "Download: https://...").
+        match = re.search(r"https?://\S+", lines[-1], re.IGNORECASE)
+        if match and _valid_batch_download_url(match.group(0).rstrip(".,)")):
+            supplied_url = match.group(0).rstrip(".,)")
+            lines = lines[:-1]
+        elif linked_url and len(lines) >= 4 and re.search(r"(?i)\b(link|download)\b", lines[-1]):
+            lines = lines[:-1]
+
+    # A Telegram text-link can display as "Link here" while its actual URL is held
+    # in MessageEntity.url. In that case the user may send only the three detail lines.
+    if not supplied_url:
+        return None
+    if not _valid_batch_download_url(supplied_url):
+        return None
+
+    details = _parse_upload_details("\n".join(lines))
+    if not details:
+        return None
+    details["fallback_download_url"] = supplied_url
+    return details
+
+
+def _linked_url_from_message(message) -> str | None:
+    """Read an attached text-link URL as well as ordinary pasted URLs."""
+    text = str(getattr(message, "text", "") or "")
+    match = re.search(r"https?://\S+", text, re.IGNORECASE)
+    if match:
+        candidate = match.group(0).rstrip(".,)")
+        if _valid_batch_download_url(candidate):
+            return candidate
+    for entity in getattr(message, "entities", None) or []:
+        entity_type = str(getattr(entity, "type", "")).casefold()
+        candidate = str(getattr(entity, "url", "") or "").strip()
+        if "text_link" in entity_type and _valid_batch_download_url(candidate):
+            return candidate
+    return None
 
 
 DEFAULT_BATCH1RENAMED_BUTTON_TEMPLATE = "#g EPISODE {episode} - {link}"
@@ -322,217 +405,15 @@ def _build_batch1renamed_button_rows(template: str, details: dict, stored_link: 
     return rows
 
 
-def _parse_batchcompleted_payload(message_text: str) -> dict:
-    """Parse /batchcompleted text while preserving the season and episode formatting."""
-    raw = (message_text or "").strip()
-    if not raw:
-        raise ValueError(
-            "Send /batchcompleted followed by the anime title, season, episode range, and download URL."
-        )
-
-    lines = raw.splitlines()
-    command_match = re.match(
-        r"^\s*/batchcompleted(?:@\w+)?(?:\s+(.*))?\s*$",
-        lines[0],
-        re.IGNORECASE,
-    )
-    if not command_match:
-        raise ValueError("The message must start with /batchcompleted.")
-
-    inline_title = (command_match.group(1) or "").strip()
-    body = "\n".join(([inline_title] if inline_title else []) + lines[1:])
-    url_matches = list(re.finditer(r"https?://[^\s<>]+", body, re.IGNORECASE))
-    if len(url_matches) != 1:
-        raise ValueError("Include exactly one complete http:// or https:// download link.")
-
-    link = url_matches[0].group(0).rstrip(".,;:!?)]")
-    parsed_link = urlparse(link)
-    if parsed_link.scheme.lower() not in {"http", "https"} or not parsed_link.netloc:
-        raise ValueError("The download link is invalid. Use a complete http:// or https:// URL.")
-    body = body.replace(url_matches[0].group(0), " ", 1)
-    detail_lines = []
-    for line in body.splitlines():
-        cleaned = line.strip()
-        if not cleaned:
-            continue
-        cleaned = re.sub(
-            r"(?i)^(?:(?:here(?:\s+is)?\s+the\s+)?(?:download\s*)?link)\s*[:\-]?\s*",
-            "",
-            cleaned,
-        ).strip()
-        if cleaned.casefold() in {"link", "download link", "here the link", "here is the link"}:
-            continue
-        if cleaned:
-            detail_lines.append(cleaned)
-
-    if len(detail_lines) < 3:
-        raise ValueError(
-            "Use this format:\n\n"
-            "/batchcompleted\nJUJUTSU KAISEN\nSeason 01 - 03\n01 - 12\nhttps://your-download-link"
-        )
-
-    title_parts = detail_lines[:-2]
-    raw_season = detail_lines[-2]
-    raw_episode = detail_lines[-1]
-    title = " ".join(
-        re.sub(r"(?i)^(?:anime|title)\s*:\s*", "", part).strip()
-        for part in title_parts
-    ).strip()
-    season_match = re.fullmatch(
-        r"\s*(?:season\s*)?(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*",
-        raw_season,
-        re.IGNORECASE,
-    )
-    episode_match = re.fullmatch(
-        r"\s*(?:episode\s*)?(\d{1,6})(?:\s*[-–]\s*(\d{1,6}))?\s*",
-        raw_episode,
-        re.IGNORECASE,
-    )
-    if not title:
-        raise ValueError("Anime title is missing.")
-    if not season_match:
-        raise ValueError("Season must be a number or range, for example: Season 01 - 03 or 01.")
-    if not episode_match:
-        raise ValueError("Episode must be a number or range, for example: 01 - 12 or 01.")
-
-    season_start, season_end = season_match.groups()
-    episode_start, episode_end = episode_match.groups()
-    if season_end and int(season_end) < int(season_start):
-        raise ValueError("The ending season cannot be less than the starting season.")
-    if episode_end and int(episode_end) < int(episode_start):
-        raise ValueError("The ending episode cannot be less than the starting episode.")
-
-    season = f"{season_start} - {season_end}" if season_end else season_start
-    episode_range = f"{episode_start} - {episode_end}" if episode_end else episode_start
-    return {
-        "title": title,
-        "season": season,
-        "episode_range": episode_range,
-        "stored_link": link,
-    }
-
-
-async def _find_saved_anime_route(title: str) -> tuple[dict | None, dict | None]:
-    """Resolve a saved Template Set and its route regardless of title letter case.
-
-    New Template Sets use a normalized, case-folded key. The case-insensitive
-    fallbacks also support older records whose title_key or string _id was saved
-    with its original capitalization.
-    """
-    title_key = normalize_anime_title(title)
-    if not title_key:
-        return None, None
-
-    database = codeflixbots.codeflixbots
-    template_sets = database["anime_templates"]
-    routes = database["anime_routes"]
-    case_insensitive_key = {"$regex": "^" + re.escape(title_key) + "$", "$options": "i"}
-
-    template_set = await template_sets.find_one({"_id": title_key})
-    if not template_set:
-        template_set = await template_sets.find_one({"title_key": title_key})
-    if not template_set:
-        template_set = await template_sets.find_one({"_id": case_insensitive_key})
-    if not template_set:
-        template_set = await template_sets.find_one({"title_key": case_insensitive_key})
-
-    route_key = normalize_anime_title(
-        (template_set or {}).get("title_key")
-        or (template_set or {}).get("title")
-        or title
-    )
-    route = await routes.find_one({"title_key": route_key}) if route_key else None
-    if not route and route_key:
-        route_key_regex = {"$regex": "^" + re.escape(route_key) + "$", "$options": "i"}
-        route = await routes.find_one({"title_key": route_key_regex})
-    if not route:
-        route_title = str((template_set or {}).get("title") or title).strip()
-        if route_title:
-            route = await routes.find_one({
-                "title": {"$regex": "^" + re.escape(route_title) + "$", "$options": "i"}
-            })
-
-    # If only the route exists (legacy setup), still try to find its Template Set
-    # so the same normalized match is used consistently by later publication code.
-    if route and not template_set:
-        route_key = normalize_anime_title(route.get("title_key") or route.get("title") or title)
-        template_set = await template_sets.find_one({"_id": route_key}) if route_key else None
-        if not template_set and route_key:
-            route_key_regex = {"$regex": "^" + re.escape(route_key) + "$", "$options": "i"}
-            template_set = await template_sets.find_one({"_id": route_key_regex})
-
-    return route, template_set
-
-
-async def _publish_batchcompleted(client, message, details: dict, poster_file_id: str | None = None) -> None:
-    """Publish only to global Ongoing Channels using the saved ongoing templates."""
-    title = str(details.get("title") or "").strip()
-    season = str(details.get("season") or "").strip()
-    episode = str(details.get("episode_range") or "").strip()
-    link = str(details.get("stored_link") or "").strip()
-
-    try:
-        ongoing_result = await _post_ongoing_anime(
-            client,
-            title,
-            season=season,
-            episode_range=episode,
-            fallback_download_url=link,
-            poster_override=poster_file_id,
-            use_saved_poster=False,
-            status_override="COMPLETED",
-            global_targets_only=True,
-        )
-    except Exception as exc:
-        logger.exception("/batchcompleted Ongoing publication failed for %s", title)
-        ongoing_result = f"❌ Ongoing publication failed: {type(exc).__name__}: {exc}"
-
-    report = (
-        f"🎬 {title} • Season {season} • Episode {episode} • COMPLETED\n\n"
-        f"📡 Ongoing Channels:\n{ongoing_result}\n\n"
-        f"🖼 Poster: {'Supplied poster' if poster_file_id else 'No poster'}\n"
-        "The supplied link was used in the Ongoing Download button."
-    )
-    await message.reply_text(
-        report,
-        disable_web_page_preview=True,
-        parse_mode=enums.ParseMode.DISABLED,
-    )
-
-
-@Client.on_message(
-    filters.private & (filters.command("batchcompleted") | filters.caption),
-    group=-7,
-)
-async def batch_completed_command(client: Client, message):
-    """Publish a completed anime from a single command, with an optional attached poster."""
-    message_text = message.text or message.caption or ""
-    if not re.match(r"^\s*/batchcompleted(?:@\w+)?(?:\s|$)", message_text, re.IGNORECASE):
-        return
-
-    user = getattr(message, "from_user", None)
-    if not user or not _is_batch_admin(user):
-        return await message.reply_text("⛔ Owner/admin only.")
-
-    try:
-        details = _parse_batchcompleted_payload(message_text)
-    except ValueError as exc:
-        return await message.reply_text(f"❌ {exc}", parse_mode=enums.ParseMode.DISABLED)
-
-    poster = getattr(getattr(message, "photo", None), "file_id", None)
-    if not poster:
-        reply_photo = getattr(message, "reply_to_message", None)
-        poster = getattr(getattr(reply_photo, "photo", None), "file_id", None)
-
-    await _publish_batchcompleted(client, message, details, poster_file_id=poster)
-
-
 async def _publish_batch1renamed_link(client, message, details: dict) -> None:
     """Publish a supplied stored link to Anime Post and Ongoing without media handling."""
     title = str(details.get("title") or "").strip()
     title_key = normalize_anime_title(title)
     link = str(details.get("stored_link") or "").strip()
-    route, _template_set = await _find_saved_anime_route(title)
+    routes = codeflixbots.codeflixbots["anime_routes"]
+    route = await routes.find_one({"title_key": title_key}) if title_key else None
+    if not route and title:
+        route = await routes.find_one({"title": {"$regex": "^" + re.escape(title) + "$", "$options": "i"}})
     if not route:
         await message.reply_text(
             f"❌ No saved channel settings were found for {title}. Add it in Admin Panel → Anime Channels first."
@@ -669,10 +550,48 @@ async def delete_batch1renamed_report(client: Client, query: CallbackQuery):
 async def _active_batch_task(user_id: int) -> dict | None:
     cursor = _batch_tasks_collection().find({
         "user_id": int(user_id),
-        "status": {"$in": ["choosing_channel", "waiting_files", "processing"]},
+        "status": {"$in": ["choosing_channel", "waiting_files", "waiting_details", "processing"]},
     }).sort("updated_at", -1).limit(1)
     rows = await cursor.to_list(length=1)
     return rows[0] if rows else None
+
+
+async def _find_batch1_template_route(title: str) -> tuple[dict | None, str | None, dict | None, str | None]:
+    """Resolve a case-insensitive saved Template Set and its Anime Post route."""
+    title_key = normalize_anime_title(str(title or ""))
+    if not title_key:
+        return None, None, None, "Send the anime title saved in Admin Panel → Templates."
+
+    templates = codeflixbots.codeflixbots["anime_templates"]
+    template_set = await templates.find_one({"_id": title_key})
+    if not template_set:
+        template_set = await templates.find_one({"title_key": title_key})
+    if not template_set:
+        template_set = await templates.find_one({
+            "title": {"$regex": "^" + re.escape(str(title).strip()) + "$", "$options": "i"}
+        })
+    if not template_set or not template_set.get("setup_complete"):
+        return None, None, None, (
+            f"No completed Template Set matches {title!r}. Use the anime title saved in Admin Panel → Templates."
+        )
+
+    route_key = str(template_set.get("title_key") or template_set.get("_id") or title_key).strip()
+    routes = codeflixbots.codeflixbots["anime_routes"]
+    route = await routes.find_one({"title_key": route_key})
+    if not route:
+        canonical_title = str(template_set.get("title") or title).strip()
+        route = await routes.find_one({
+            "title": {"$regex": "^" + re.escape(canonical_title) + "$", "$options": "i"}
+        })
+    if not route or not route.get("individual_channel"):
+        return template_set, route_key, None, (
+            f"Template Set {template_set.get('title') or title!r} has no Anime Post channel. "
+            "Fix its channel in Admin Panel → Templates/Anime Channels."
+        )
+    # The route may have a legacy title_key that differs from the template's key.
+    # Keep the actual route key for the publisher's exact channel lookup.
+    route_key = str(route.get("title_key") or route_key).strip()
+    return template_set, route_key, route, None
 
 
 async def _batch_routes_keyboard(user_id: int, batch_number: int, routes: list[dict]):
@@ -732,6 +651,37 @@ async def start_manual_batch(client: Client, message):
             f"⚠️ Batch{active_no} is currently {active.get('status', 'active').replace('_', ' ')}.\n"
             "Finish or cancel that task before starting another batch, so uploaded files cannot go to the wrong anime."
         )
+
+    if details.get("await_details_after_files"):
+        if int(user.id) in _MEDIA_WAITING_DETAILS or int(user.id) in _MEDIA_PROCESSING or _MEDIA_QUEUES.get(int(user.id)):
+            return await message.reply_text(
+                "⚠️ Finish the current single-file rename queue first. Then send /batch1 to start a separate 3-file batch."
+            )
+        now = datetime.utcnow()
+        task = {
+            "_id": _batch_task_id(user.id, batch_number),
+            "user_id": int(user.id),
+            "batch_number": batch_number,
+            "details": {},
+            "await_details_after_files": True,
+            "route_choices": [],
+            "selected_route_key": None,
+            "template_set_key": None,
+            "files": [],
+            "status": "waiting_files",
+            "created_at": now,
+            "updated_at": now,
+        }
+        await _batch_tasks_collection().replace_one({"_id": task["_id"]}, task, upsert=True)
+        await message.reply_text(
+            "📦 **Batch1 started**\n\n"
+            "📥 Send exactly 3 quality files for the same episode (480p, 720p, and 1080p).\n"
+            "Files received: 0/3\n\n"
+            "After all 3 files arrive, I will ask for the anime title, season, episode, and Download link.\n"
+            "Renaming, Telegram File Store saving, link generation, and publishing start only after those details are accepted.\n\n"
+            "Use /cancel to stop this batch."
+        )
+        return
 
     # A completed Template Set is selected automatically by the normalized anime title.
     # Legacy routes without a completed set keep the original manual channel picker.
@@ -1063,9 +1013,83 @@ async def _prompt_for_next_file(client, user_id: int):
 @Client.on_message(filters.private & filters.text, group=-8)
 async def collect_upload_details(client: Client, message):
     user = getattr(message, "from_user", None)
-    if not user or user.id not in _MEDIA_WAITING_DETAILS:
+    if not user:
         return
     text = (message.text or "").strip()
+
+    # New /batch1 sequence: after the third source file, accept publishing details
+    # and a per-run Download URL. Keep this before the legacy single-file queue
+    # guard so the batch prompt does not depend on _MEDIA_WAITING_DETAILS.
+    batch_task = await _active_batch_task(user.id) if _is_batch_admin(user) else None
+    if (
+        batch_task
+        and int(batch_task.get("batch_number", 0)) == 1
+        and batch_task.get("await_details_after_files")
+        and batch_task.get("status") == "waiting_details"
+    ):
+        if re.match(r"^/(?:batch[1-5]|batch1renamed|cancel)(?:@\w+)?(?:\s|$)", text, re.I):
+            return
+        if not _is_batch_admin(user):
+            return await message.reply_text("⛔ Owner/admin only.")
+
+        details = _parse_batch1_post_details(text, _linked_url_from_message(message))
+        if not details:
+            await message.reply_text(
+                "❌ I couldn't read the publishing details. Send them in this format:\n\n"
+                "Naruto Shippuden\n"
+                "Season 01\n"
+                "355\n"
+                "https://your-download-link\n\n"
+                "A Telegram text-link such as ‘Link here’ is also accepted."
+            )
+            raise StopPropagation
+
+        template_set, route_key, route, route_error = await _find_batch1_template_route(details["title"])
+        if route_error:
+            await message.reply_text(f"❌ {route_error}\n\nSend the title again with the correct saved Template Set name.")
+            raise StopPropagation
+
+        # Use the saved display title for filenames/captions while retaining the
+        # normalized canonical key for route lookup and episode grouping.
+        details["title"] = str(template_set.get("title") or details["title"]).strip()
+        details["route_title_key"] = route_key
+        task_id = batch_task["_id"]
+        async with _BATCH_TASK_LOCKS[int(user.id)]:
+            update_result = await _batch_tasks_collection().update_one(
+                {"_id": task_id, "user_id": int(user.id), "status": "waiting_details"},
+                {"$set": {
+                    "details": details,
+                    "selected_route_key": route_key,
+                    "template_set_key": template_set.get("_id") or route_key,
+                    "status": "processing",
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+        if not getattr(update_result, "matched_count", 0):
+            await message.reply_text("⚠️ This Batch1 session has already moved on. Check its latest status before resending.")
+            raise StopPropagation
+
+        refreshed_task = {
+            **batch_task,
+            "details": details,
+            "selected_route_key": route_key,
+            "template_set_key": template_set.get("_id") or route_key,
+            "status": "processing",
+        }
+        status_message = await message.reply_text(
+            "✅ Publishing details accepted.\n"
+            "⏳ Processing the 3 files in order: rename → Telegram File Store → links → Anime Post + Ongoing Post.\n"
+            "The supplied URL will be used only for the Ongoing Download button."
+        )
+        _BATCH_WORKING_USERS.add(int(user.id))
+        try:
+            await _complete_manual_batch(client, refreshed_task, status_message)
+        finally:
+            _BATCH_WORKING_USERS.discard(int(user.id))
+        raise StopPropagation
+
+    if user.id not in _MEDIA_WAITING_DETAILS:
+        return
     if re.match(r"^/batch[1-5](?:@\w+)?(?:\s|$)", text, re.I):
         return
     if re.match(r"^/cancel(?:@\w+)?(?:\s|$)", text, re.I):
@@ -1211,6 +1235,12 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             if batch_task and batch_task.get("status") == "choosing_channel":
                 await message.reply_text("⚠️ Select an anime channel from the buttons first. Then send the 3 files.")
                 raise StopPropagation
+            if batch_task and batch_task.get("status") == "waiting_details":
+                await message.reply_text(
+                    f"✅ Batch{batch_task.get('batch_number')} already has 3/3 files. "
+                    "Send the publishing details text (anime title, season, episode, and Download link) instead of another file."
+                )
+                raise StopPropagation
             if batch_task and batch_task.get("status") == "processing":
                 await message.reply_text(f"⏳ Batch{batch_task.get('batch_number')} is processing its queued files. Please wait for it to finish.")
                 raise StopPropagation
@@ -1236,7 +1266,12 @@ async def auto_rename_files(client, message, _details: dict | None = None):
                 incoming.append(source_info)
                 incoming.sort(key=lambda item: int(item.get("message_id", 0)))
                 new_count = len(incoming)
-                new_status = "processing" if new_count == _BATCH_FILE_LIMIT else "waiting_files"
+                needs_details = bool(batch_task.get("await_details_after_files"))
+                new_status = (
+                    "waiting_details" if new_count == _BATCH_FILE_LIMIT and needs_details
+                    else "processing" if new_count == _BATCH_FILE_LIMIT
+                    else "waiting_files"
+                )
                 await _batch_tasks_collection().update_one(
                     {"_id": batch_task["_id"], "status": "waiting_files"},
                     {"$set": {"files": incoming, "status": new_status, "updated_at": datetime.utcnow()}},
@@ -1245,6 +1280,18 @@ async def auto_rename_files(client, message, _details: dict | None = None):
                     await message.reply_text(
                         f"📥 Batch{batch_task.get('batch_number')} files received: {new_count}/3\n"
                         f"Send {3-new_count} more file(s). Processing starts only after all 3 arrive."
+                    )
+                    raise StopPropagation
+                if needs_details:
+                    await message.reply_text(
+                        f"✅ Batch{batch_task.get('batch_number')}: files received 3/3.\n\n"
+                        "📝 Now send the publishing details in this format:\n"
+                        "Naruto Shippuden\n"
+                        "Season 01\n"
+                        "355\n"
+                        "https://your-download-link\n\n"
+                        "The title can use any capitalization; it must match a completed saved Template Set.\n"
+                        "The supplied URL replaces the Ongoing post's Download button link."
                     )
                     raise StopPropagation
                 batch_status_message = await message.reply_text(
@@ -1347,14 +1394,17 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             if not downloaded_path or not os.path.isfile(downloaded_path):
                 raise RuntimeError("Telegram download did not produce a file")
 
-            # Inspect the original uploaded file before choosing the final filename.
-            # This fixes files named without a quality marker being renamed [Unknown].
+            # Prefer the actual video dimensions to possibly incorrect release-name
+            # tags. Telegram video uploads provide width/height cheaply; ffprobe is
+            # used only when those dimensions are unavailable (for document uploads).
             detected_quality = None
-            # If the source filename already contains a recognized quality, preserve it and
-            # skip ffprobe. This avoids a subprocess delay for most uploads without changing
-            # their names. Probe only when quality is absent/unknown.
-            source_quality = extract_quality(original_name)
-            if (extension in VIDEO_EXTENSIONS or media_type == "video") and source_quality.strip().casefold() == "unknown":
+            source_mime = str(getattr(media, "mime_type", "") or "").casefold()
+            is_video_source = (
+                extension in VIDEO_EXTENSIONS
+                or media_type == "video"
+                or source_mime.startswith("video/")
+            )
+            if is_video_source:
                 detected_quality = await _detect_video_quality(downloaded_path, media)
             if not skip_rename:
                 new_filename = _render_filename_for_details(
@@ -1387,8 +1437,12 @@ async def auto_rename_files(client, message, _details: dict | None = None):
 
             caption_template = await codeflixbots.get_caption(user_id)
             caption = format_caption(caption_template, new_filename, file_size, duration)
+            # Escape user-controlled filename/template text, then apply bold HTML.
+            # Telegram controls foreground color through the user's theme; Bot API
+            # formatting does not support forcing black text.
             if len(caption) > 1024:
                 caption = caption[:1021] + "..."
+            caption = f"<b>{html.escape(caption, quote=False)}</b>"
             thumbnail_path = await _get_thumbnail_path(client, message, user_id, work_dir)
 
             # Retain the incoming media type unless the user's /setmedia preference is
@@ -1417,7 +1471,7 @@ async def auto_rename_files(client, message, _details: dict | None = None):
             upload_params = {
                 "chat_id": message.chat.id,
                 "caption": caption,
-                "parse_mode": None,
+                "parse_mode": enums.ParseMode.HTML,
                 "progress": progress_for_pyrogram,
                 "progress_args": ("Uploading...", status, time.time()),
             }

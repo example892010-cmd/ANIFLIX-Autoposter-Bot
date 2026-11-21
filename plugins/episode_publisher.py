@@ -11,6 +11,7 @@ import re
 from difflib import SequenceMatcher
 import os
 import secrets
+from urllib.parse import urlparse
 from datetime import datetime
 from typing import Any
 
@@ -67,6 +68,15 @@ DEFAULT_ANIME_BUTTONS_TEMPLATE = (
 
 def _now():
     return datetime.utcnow()
+
+
+def _valid_http_url(value: str | None) -> bool:
+    """Accept only complete HTTP(S) URLs for per-batch Download button overrides."""
+    try:
+        parsed = urlparse(str(value or "").strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    except Exception:
+        return False
 
 
 def _title_key(title: str) -> str:
@@ -351,7 +361,11 @@ async def _send_target(client, route: dict, batch: dict, mode: str, target_overr
         invite_links = list(invite_doc.get("links") or [])
         post_settings = await codeflixbots.codeflixbots["post_template_settings"].find_one({"_id": "global"}) or {}
         button_template = post_settings.get("ongoing_buttons_template") or "#b ✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗡𝗢𝗪 ✦ - {anime_invite}\n#r 𖤓𝗔𝗡𝗜𝗠𝗘 𝗜𝗡𝗗𝗘𝗫 𝗧𝗔𝗠𝗜𝗟𖤓 - https://t.me/+qGiH-Zw3ydJjZjU1"
-        keyboard = _build_ongoing_button_rows(button_template, invite_links)
+        keyboard = _build_ongoing_button_rows(
+            button_template,
+            invite_links,
+            fallback_download_url=batch.get("fallback_download_url"),
+        )
         api_target = int(target) if isinstance(target, str) and target.lstrip("-").isdigit() else target
         sent_id = await _send_ongoing_bot_api(client, api_target, poster_file_id, caption, keyboard)
         stored_chat_id = int(chat.id) if chat is not None else (int(target) if isinstance(target, int) or (isinstance(target, str) and target.lstrip("-").isdigit()) else str(target))
@@ -862,6 +876,11 @@ async def _store_file_and_process_locked(client, sent_message, new_filename: str
                 "last_error": None,
                 **({"published_targets": {}} if republishing else {}),
                 **({"route_title_key": details.get("route_title_key")} if details and details.get("route_title_key") else {}),
+                "fallback_download_url": (
+                    str(details.get("fallback_download_url")).strip()
+                    if details and _valid_http_url(details.get("fallback_download_url"))
+                    else None
+                ),
             },
         },
         upsert=True,
