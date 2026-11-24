@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that the /batch1renamed dual-publish fix is present.
-
-The fix is included directly in plugins/file_rename.py and plugins/ongoing_posts.py.
-This script is intentionally read-only; it never rewrites production source files.
-Run from the repository root with: python apply_fix.py --check
-"""
+"""Read-only source verification for ANIFLIX /batchcompleted publishing."""
 from __future__ import annotations
 
 import argparse
@@ -22,45 +17,40 @@ def verify() -> list[str]:
         if not path.is_file():
             problems.append(f"Missing required source file: {path.relative_to(ROOT)}")
             continue
-        source = path.read_text(encoding="utf-8")
         try:
-            ast.parse(source, filename=str(path))
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except SyntaxError as exc:
             problems.append(f"Syntax error in {path.relative_to(ROOT)}: {exc}")
-
     if problems:
         return problems
 
     file_source = FILE_RENAME.read_text(encoding="utf-8")
     ongoing_source = ONGOING_POSTS.read_text(encoding="utf-8")
     required_file_features = {
-        "Ongoing publisher import": "from plugins.ongoing_posts import post_ongoing_anime as _post_ongoing_anime",
-        "direct Bot API Anime Post send": "await _send_ongoing_bot_api(client, api_target, None, caption, button_rows)",
-        "Ongoing publish attempt": "await _post_ongoing_anime(",
-        "numeric private-channel ID handling": "individual_target.lstrip(\"-\").isdigit()",
-        "independent Anime Post result": "anime_result = f\"❌ Anime Post failed:",
-        "link-only no-media confirmation": "No media was downloaded or stored by this command.",
-        "/batchcompleted command handler": "async def batch_completed_command(",
-        "/batchcompleted payload parser": "def _parse_batchcompleted_payload(",
-        "completed publishing workflow": "async def _publish_batchcompleted(",
-        "submitted poster is passed through": "poster_override=poster_file_id",
-        "saved Anime Post template is reused": 'settings.get("anime_post_template")',
-        "case-insensitive saved Template Set resolver": "async def _find_saved_anime_route(title: str)",
-        "batch1renamed uses shared case-insensitive resolver": "route, _template_set = await _find_saved_anime_route(title)",
+        "batchcompleted command handler": "async def batch_completed_command(",
+        "batchcompleted payload parser": "def _parse_batchcompleted_payload(",
+        "comma-separated season support": r"\d{1,3}(?:\s*,\s*\d{1,3})*",
+        "Anime Post saved text template": 'settings.get("anime_post_template")',
+        "optional photo passed to Anime Post": "_send_ongoing_bot_api(client, api_target, poster_file_id, caption, button_rows)",
+        "Anime Post does not reuse the Ongoing download URL": "button_rows = []",
+        "Ongoing publication attempt": "await _post_ongoing_anime(",
+        "Ongoing Download URL override": "fallback_download_url=link",
+        "COMPLETED status": 'status_override="COMPLETED"',
+        "global Ongoing channel configuration": "global_targets_only=True",
+        "no saved-poster lookup for this command": "use_saved_poster=False",
     }
     for label, snippet in required_file_features.items():
         if snippet not in file_source:
             problems.append(f"Missing {label} in plugins/file_rename.py")
 
     required_ongoing_features = {
-        "episode override parameters": "episode_range: str | None = None",
-        "saved global-channel fallback": "await resolve_ongoing_targets(route, codeflixbots.codeflixbots)",
-        "saved ongoing button template": "ongoing_buttons_template",
-        "saved ongoing post text": "ongoing_template",
-        "saved anime poster": "saved_template.get(\"poster_file_id\")",
-        "poster override support": "poster_override: str | None = None",
-        "saved poster can be bypassed": "use_saved_poster: bool = True",
-        "completed status override": "status_override: str | None = None",
+        "global-channel-only mode": "global_targets_only: bool = False",
+        "global Ongoing target resolution": "await resolve_ongoing_targets(route, codeflixbots.codeflixbots)",
+        "saved Ongoing text template": "ongoing_template",
+        "saved Ongoing button template": "ongoing_buttons_template",
+        "dynamic Download URL override": "fallback_download_url=fallback_download_url",
+        "COMPLETED status override": "status_override: str | None = None",
+        "published-post history recording": "_record_bot_published_post(",
     }
     for label, snippet in required_ongoing_features.items():
         if snippet not in ongoing_source:
@@ -78,10 +68,10 @@ def main() -> int:
         for problem in problems:
             print(f"- {problem}")
         return 1
-    print("✅ /batch1renamed dual publishing and /batchcompleted are present; source syntax is valid.")
-    print("✅ Saved anime Template Sets and channel routes resolve with uppercase, lowercase, or mixed-case titles.")
-    print("✅ /batchcompleted reuses saved text/button templates, accepts an optional supplied poster, and bypasses saved posters when none is supplied.")
-    print("ℹ️ This is an offline source check. Telegram permissions, MongoDB records, and live posting still require deployment testing.")
+    print("✅ /batchcompleted source checks passed.")
+    print("✅ Anime Post and Ongoing Post use their existing saved templates and channels.")
+    print("✅ Season range/list and episode range/single values are supported; poster is optional.")
+    print("ℹ️ Offline checks only: live Telegram/MongoDB publishing still requires deployment testing.")
     return 0
 
 

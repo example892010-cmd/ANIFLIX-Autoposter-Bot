@@ -19,7 +19,7 @@ class SourceVerificationTests(unittest.TestCase):
 
     def test_verifier_remains_read_only(self):
         source = (ROOT / "apply_fix.py").read_text(encoding="utf-8")
-        self.assertIn("intentionally read-only", source)
+        self.assertIn("Read-only", source)
         self.assertNotIn("write_text(", source)
         self.assertNotIn("transform_file_rename", source)
 

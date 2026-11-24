@@ -153,7 +153,9 @@ async def _send_bot_api(client: Client, chat_id: int, poster: str | None, captio
     if not token:
         raise RuntimeError("BOT_TOKEN is not configured")
     method = "sendPhoto" if poster else "sendMessage"
-    payload: dict[str, Any] = {"chat_id": chat_id, "reply_markup": {"inline_keyboard": button_rows}}
+    payload: dict[str, Any] = {"chat_id": chat_id}
+    if button_rows:
+        payload["reply_markup"] = {"inline_keyboard": button_rows}
     if poster:
         payload.update({"photo": poster, "caption": caption, "parse_mode": "HTML"})
     else:
@@ -191,8 +193,14 @@ async def _send_bot_api(client: Client, chat_id: int, poster: str | None, captio
     raise RuntimeError("Telegram did not accept the ongoing post")
 
 
-async def _record_bot_published_ongoing_post(client: Client, target: Any, message_id: int, title: str) -> None:
-    """Persist the exact channel/message pair so admins can safely edit its buttons later."""
+async def _record_bot_published_post(
+    client: Client, target: Any, message_id: int, title: str, post_type: str = "ongoing"
+) -> None:
+    """Record the exact channel/message pair after a successful bot publication.
+
+    The record powers the admin panel's safe in-place button editor. History failures
+    are logged but never turn a successful Telegram send into a failed publication.
+    """
     channel_id: Any = target
     try:
         chat = await client.get_chat(target)
@@ -200,7 +208,11 @@ async def _record_bot_published_ongoing_post(client: Client, target: Any, messag
     except Exception:
         if isinstance(target, str) and target.lstrip("-").isdigit():
             channel_id = int(target)
-        logger.debug("Could not resolve ongoing destination %s after successful send", target, exc_info=True)
+        logger.debug(
+            "Could not resolve published destination %s after successful send",
+            target, exc_info=True,
+        )
+
     record_id = f"{channel_id}:{int(message_id)}"
     try:
         await codeflixbots.codeflixbots["bot_published_messages"].update_one(
@@ -209,14 +221,15 @@ async def _record_bot_published_ongoing_post(client: Client, target: Any, messag
                 "channel_id": channel_id,
                 "message_id": int(message_id),
                 "title": str(title or "Anime"),
-                "post_type": "ongoing",
+                "post_type": str(post_type or "ongoing"),
                 "published_at": datetime.now(timezone.utc),
             }},
             upsert=True,
         )
     except Exception:
-        # A history write must never turn an already-sent Telegram post into a failure.
-        logger.exception("Ongoing post was sent, but its editable-post history record could not be saved")
+        logger.exception(
+            "Post was sent but its editable-post history record could not be saved"
+        )
 
 
 async def post_ongoing_anime(
@@ -225,18 +238,28 @@ async def post_ongoing_anime(
     season: str | None = None,
     episode_range: str | None = None,
     fallback_download_url: str | None = None,
+    poster_override: str | None = None,
+    use_saved_poster: bool = True,
+    status_override: str | None = None,
+    global_targets_only: bool = False,
 ) -> str:
-    """Publish the selected anime's ongoing post to its saved ongoing channel targets."""
+    """Publish an ongoing post; optionally use only globally configured ongoing channels."""
     key = _title_key(title)
     if not key:
         return "❌ Send an anime title, e.g. /ongoing Naruto Shippuden."
 
     routes = codeflixbots.codeflixbots["anime_routes"]
-    route = await routes.find_one({"title_key": key})
-    if not route:
-        route = await routes.find_one({"title": {"$regex": "^" + re.escape(title.strip()) + "$", "$options": "i"}})
-    if not route:
-        return f"❌ No saved channel/template settings were found for {title}. Add it in Admin Panel → Anime Channels."
+    route = None
+    if not global_targets_only:
+        route = await routes.find_one({"title_key": key})
+        if not route:
+            route = await routes.find_one({"title": {"$regex": "^" + re.escape(title.strip()) + "$", "$options": "i"}})
+        if not route:
+            return f"❌ No saved channel/template settings were found for {title}. Add it in Admin Panel → Anime Channels."
+    else:
+        # Completed batch posts intentionally bypass anime-specific Anime Channel
+        # routing and publish to the globally configured Ongoing Channels only.
+        route = {"title": title, "title_key": key, "ongoing_details": {}}
 
     invite_collection = codeflixbots.codeflixbots["anime_invite_links"]
     route_key = str(route.get("title_key") or key).strip()
@@ -259,6 +282,16 @@ async def post_ongoing_anime(
         )
     except ValueError as exc:
         return f"❌ Ongoing button template error: {exc}"
+    if fallback_download_url:
+        expected_download_url = str(fallback_download_url).strip()
+        if not any(
+            str(button.get("url") or "").strip() == expected_download_url
+            for row in button_rows for button in row
+        ):
+            return (
+                "❌ The saved Ongoing Buttons template has no dynamic Download button. "
+                "Add {anime_invite} or use a button label containing DOWNLOAD so the supplied link can replace it."
+            )
 
     targets = await resolve_ongoing_targets(route, codeflixbots.codeflixbots)
     if not targets:
@@ -286,12 +319,17 @@ async def post_ongoing_anime(
         "episode_range": episode_value,
         "episode": episode_value,
         "tag": details.get("tag") or "",
-        "status": details.get("status") or "ONGOING",
+        "status": str(status_override).strip() if status_override else (details.get("status") or "ONGOING"),
         "qualities": qualities,
         "audio": "Tamil Audio",
     }
     template = post_settings.get("ongoing_template") or DEFAULT_ONGOING_TEMPLATE
-    poster = saved_template.get("poster_file_id") or route.get("poster_file_id")
+    if poster_override:
+        poster = poster_override
+    elif use_saved_poster:
+        poster = saved_template.get("poster_file_id") or route.get("poster_file_id")
+    else:
+        poster = None
     caption = _render_template(template, values, limit=1024 if poster else 4096)
 
     success, failures = [], []
@@ -302,7 +340,9 @@ async def post_ongoing_anime(
             # Render restarts (especially for private numeric channel IDs).
             api_target = int(target) if isinstance(target, str) and target.lstrip("-").isdigit() else target
             message_id = await _send_bot_api(client, api_target, poster, caption, button_rows)
-            await _record_bot_published_ongoing_post(client, api_target, message_id, str(route.get("title") or title))
+            await _record_bot_published_post(
+                client, api_target, message_id, str(route.get("title") or title), "ongoing"
+            )
             success.append(f"{target} (message {message_id})")
         except Exception as exc:
             logger.exception("Ongoing post failed for %s", target)
