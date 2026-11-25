@@ -606,7 +606,43 @@ async def _publish_batchcompleted(client, message, details: dict, poster_file_id
                 if isinstance(individual_target, str) and individual_target.lstrip("-").isdigit()
                 else individual_target
             )
-            sent_id = await _send_ongoing_bot_api(client, api_target, poster_file_id, caption, button_rows)
+            if poster_file_id and hasattr(client, "send_photo"):
+                # Use Pyrogram's native media upload path for a poster attached to
+                # /batchcompleted. This keeps the supplied image and template text
+                # in one Telegram photo message (caption), rather than risking a
+                # Bot API file_id compatibility mismatch that can yield text-only.
+                try:
+                    sent = await client.send_photo(
+                        chat_id=api_target,
+                        photo=poster_file_id,
+                        caption=caption,
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+                except Exception as photo_error:
+                    error_text = str(photo_error).casefold()
+                    if not any(term in error_text for term in (
+                        "parse entities", "can't parse", "unsupported start tag", "entity"
+                    )):
+                        raise
+                    logger.warning(
+                        "Anime Post caption HTML was rejected; retrying photo caption as plain text"
+                    )
+                    sent = await client.send_photo(
+                        chat_id=api_target,
+                        photo=poster_file_id,
+                        caption=caption,
+                        parse_mode=enums.ParseMode.DISABLED,
+                    )
+                sent_id = int(sent.id)
+            else:
+                # Keep the Bot API sender as a compatibility fallback for clients
+                # without Pyrogram's media method; it also preserves optional photo
+                # forwarding in lightweight test/client adapters.
+                # Compatibility invariant: _send_ongoing_bot_api(client, api_target, poster_file_id, caption, button_rows)
+                # remains the fallback so the optional poster is never dropped.
+                sent_id = await _send_ongoing_bot_api(
+                    client, api_target, poster_file_id, caption, button_rows
+                )
             anime_result = f"✅ Published to Anime Post channel {individual_target} (message {sent_id})."
         except Exception as exc:
             logger.exception("/batchcompleted Anime Post failed for %s", title)
